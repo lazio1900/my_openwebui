@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version:*)",
+      "Bash(git --version:*)",
+      "Bash(git clone:*)",
+      "Bash(dir:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git fetch:*)",
+      "Bash(NEW_NODE=\"/c/Users/user/AppData/Local/Microsoft/WinGet/Packages/OpenJS.NodeJS.22_Microsoft.Winget.Source_8wekyb3d8bbwe/node-v22.22.0-win-x64\")",
+      "Bash(\"$NEW_NODE/node.exe\" --version)",
+      "Bash(\"$NEW_NODE/npm.cmd\" --version)",
+      "Bash(export:*)",
+      "Bash(node --version:*)",
+      "Bash(npm run build:*)",
+      "Bash(python -m venv:*)",
+      "Bash(./venv/Scripts/pip.exe install:*)",
+      "Bash(./venv/Scripts/python.exe -m uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe:*)",
+      "Bash(docker compose up:*)"
+    ]
+  }
+}

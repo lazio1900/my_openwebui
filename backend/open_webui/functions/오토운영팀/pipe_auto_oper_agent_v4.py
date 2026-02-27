@@ -19,6 +19,28 @@
 #   - 스트리밍 답변 완료 후 마크다운 형태로 추천 질문 표시
 #   - LLM 호출: 4~5회 (분류1 + ReAct1~2 + 생성1 + 후속질문1)
 #   - ENABLE_FOLLOWUPS Valve로 기능 ON/OFF 가능
+# 2026-02-27 v2(운영) : 운영환경 적용
+#   - generate_chat_completion()으로 LLM 호출 전환 (OpenAI 직접 호출 제거)
+#   - SentenceTransformerEmbeddings(kure)로 임베딩 전환
+#   - StreamingResponse 인터셉트 방식으로 스트리밍 답변 생성
+# 2026-02-27 v3(운영) : 재질의 고도화 + 추천질문 개선
+#   - 재질의 사유 세분화 (업무외/모호/정보부족) → 상황별 맞춤 안내
+#   - CLASSIFY_PROMPT에 requery_reason, requery_detail 출력 추가
+#   - REQUERY_PROMPT: 사유별 응답 전략 + 바로 입력 가능한 추천 질문
+#   - FOLLOWUP_PROMPT: 업무 처리 유도형 추천 질문으로 개선
+#   - _generate_with_image()에 citation 전송 추가
+# 2026-02-27 v4(운영) : 하이브리드 검색 (벡터 + BM25 + RRF)
+#   - BM25Okapi 키워드 검색 추가 (rank-bm25, 기설치 패키지)
+#   - __init__에서 subtask별 BM25 인덱스 사전 구축
+#   - _execute_tool(): 벡터 2K + BM25 2K → RRF 결합 → 최종 K개
+#   - _rrf_merge(): Reciprocal Rank Fusion 결합 메서드 추가
+#   - ENABLE_HYBRID_SEARCH, RRF_K Valve로 ON/OFF 및 튜닝 가능
+# 2026-02-27 v5(운영) : 답변 신뢰도 검증 (Grounding Check)
+#   - GENERATE_PROMPT에 답변 근거 원칙 추가 (환각 사전 방지)
+#   - _check_grounding(): 답변 완료 후 참고자료 기반 신뢰도 검증 (LLM 1회)
+#   - 답변 끝에 신뢰도 점수 표시 (1~10점 + 사유)
+#   - _generate(), _generate_with_image() 양쪽 경로 모두 적용
+#   - ENABLE_GROUNDING_CHECK Valve로 ON/OFF 가능
 ############################################
 
 ##########################################################################
@@ -34,11 +56,15 @@ import sys                              # 에러 발생 시 라인 번호 추출
 
 import chromadb                         # ChromaDB 벡터 DB 클라이언트
 from langchain_chroma import Chroma     # LangChain-ChromaDB 래퍼 (similarity_search)
-from langchain_openai import OpenAIEmbeddings  # OpenAI 임베딩 (text-embedding-3-small)
-from openai import AsyncOpenAI          # OpenAI API 비동기 클라이언트
+from langchain_community.embeddings import SentenceTransformerEmbeddings  # 로컬 임베딩 (kure)
+from langchain_core.documents import Document  # BM25 검색 결과를 Document 객체로 변환
+from rank_bm25 import BM25Okapi         # BM25 키워드 검색 (하이브리드 검색용)
 
 from open_webui.utils.misc import get_last_user_message  # 대화에서 마지막 사용자 메시지 추출
+from open_webui.models.users import Users                # 사용자 DB 조회
+from open_webui.utils.chat import generate_chat_completion  # Open WebUI 내장 LLM 호출
 from fastapi import Request             # Open WebUI 요청 객체
+from fastapi.responses import StreamingResponse  # SSE 스트리밍 응답
 
 
 ##########################################################################
@@ -150,20 +176,23 @@ class Pipe:
     # 저장하면 Pipe가 재생성되어 __init__이 다시 실행됨
     # ------------------------------------------------------------------
     class Valves(BaseModel):
+        EMBED_PATH: str = "/data1/embedding/kure"    # SentenceTransformer 임베딩 모델 경로
+        CHROMA_PORT: int = 8800                       # ChromaDB 포트
+        CHROMA_IP: str = "172.18.237.81"             # ChromaDB 호스트 (운영 서버)
+        LLM_MODEL_NAME: str = "gpt-oss-120b"         # LLM 모델명 (Ollama)
         BASE_IMG_URL: str = "https://ai.wooricap.com/static/auto_oper_images/"
-        CHROMA_PORT: int = 8800           # ChromaDB 포트 (운영: 8800, Docker 로컬: 8800)
-        CHROMA_IP: str = "localhost"      # ChromaDB 호스트 (운영: 172.18.237.81)
         STANDARD_COLLECTION_NAME_IMAGE: str = "auto_oper_standard_image"
         STANDARD_COLLECTION_NAME_TEXT: str = "auto_oper_standard_text"
-        EMBEDDING_K: int = 5             # 벡터 검색 시 반환할 문서 수
-        # OpenAI API 설정 (개발환경: OpenAI 직접 / 운영환경: generate_chat_completion)
-        OPENAI_API_KEY: str = ""         # Valves UI에서 입력
-        OPENAI_MODEL: str = "gpt-4o-mini"
-        OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+        EMBEDDING_K: int = 5                          # 벡터 검색 시 최종 반환 문서 수
         # ReAct 에이전트 설정
-        REACT_MAX_ITERATIONS: int = 3    # Think→Act→Observe 최대 반복 횟수
+        REACT_MAX_ITERATIONS: int = 3                 # Think→Act→Observe 최대 반복 횟수
         # 후속 질문 생성 설정
-        ENABLE_FOLLOWUPS: bool = True    # False로 하면 추천 질문 미표시
+        ENABLE_FOLLOWUPS: bool = True                 # False로 하면 추천 질문 미표시
+        # 하이브리드 검색 설정
+        ENABLE_HYBRID_SEARCH: bool = True             # False로 하면 벡터 검색만 사용
+        RRF_K: int = 60                               # RRF 상수 (기본 60, 클수록 순위 차이 완화)
+        # 답변 신뢰도 검증 설정
+        ENABLE_GROUNDING_CHECK: bool = True           # False로 하면 신뢰도 검증 미수행
 
     def __init__(self):
         self.valves = self.Valves()
@@ -171,35 +200,16 @@ class Pipe:
         self._state_lock = asyncio.Lock()           # 동시 접근 방지 Lock
         self._state_ttl_sec = 60 * 60               # 1시간 후 상태 자동 삭제
 
-        # ★ Lazy 초기화: __init__ 시점에는 Valves가 기본값(빈 API 키)이므로,
-        #   실제 pipe() 호출 시점에 클라이언트를 생성해야 Valves 값이 반영됨
-        self.openai_client = None
-        self.chroma_db_text = None
-        self.chroma_db_image = None
-        self._initialized = False
-
-        print("Orchestrator + ReAct 에이전트 Pipe 등록 완료! (lazy init)")
-
-    def _ensure_initialized(self):
-        """pipe() 첫 호출 시 실행. Valves 값이 확정된 후 외부 클라이언트 초기화."""
-        if self._initialized:
-            return
-
-        # OpenAI 비동기 클라이언트 (LLM 호출용)
-        self.openai_client = AsyncOpenAI(api_key=self.valves.OPENAI_API_KEY)
-
-        # ChromaDB HTTP 클라이언트 (벡터 DB 연결)
+        # ★ Eager 초기화: 운영환경에서는 Valves 기본값이 운영 설정이므로
+        #   __init__ 시점에서 바로 임베딩 + ChromaDB 초기화
         chroma_client = chromadb.HttpClient(
             host=self.valves.CHROMA_IP, port=self.valves.CHROMA_PORT
         )
 
-        # 임베딩 함수 (ChromaDB 검색 시 쿼리를 벡터로 변환)
-        embedding_func = OpenAIEmbeddings(
-            model=self.valves.OPENAI_EMBEDDING_MODEL,
-            openai_api_key=self.valves.OPENAI_API_KEY,
+        embedding_func = SentenceTransformerEmbeddings(
+            model_name=self.valves.EMBED_PATH, model_kwargs={"device": "cpu"}
         )
 
-        # Chroma 검색 객체 2개 (텍스트 컬렉션 + 이미지 컬렉션)
         self.chroma_db_text = Chroma(
             client=chroma_client,
             collection_name=self.valves.STANDARD_COLLECTION_NAME_TEXT,
@@ -212,8 +222,43 @@ class Pipe:
             embedding_function=embedding_func,
         )
 
-        self._initialized = True
-        print("Orchestrator + ReAct 에이전트 초기화 완료!")
+        # ── BM25 인덱스 구축 (하이브리드 검색용) ──
+        # ChromaDB에서 전체 문서를 로드하여 subtask별 BM25 인덱스를 미리 구축.
+        # Pipe 초기화 시 1회만 수행. Valves 저장 시 __init__ 재실행으로 자동 갱신.
+        self._bm25_indices = {}   # subtask → BM25Okapi 인덱스
+        self._bm25_docs = {}      # subtask → [Document, ...]
+
+        if self.valves.ENABLE_HYBRID_SEARCH:
+            try:
+                raw_collection = chroma_client.get_collection(
+                    self.valves.STANDARD_COLLECTION_NAME_TEXT
+                )
+                all_data = raw_collection.get(include=["documents", "metadatas"])
+
+                # subtask별로 문서 그룹화
+                subtask_groups: Dict[str, list] = {}
+                for doc_text, metadata in zip(
+                    all_data["documents"], all_data["metadatas"]
+                ):
+                    st = metadata.get("subtask", "")
+                    if st not in subtask_groups:
+                        subtask_groups[st] = []
+                    subtask_groups[st].append(
+                        Document(page_content=doc_text, metadata=metadata)
+                    )
+
+                # subtask별 BM25 인덱스 생성 (공백 기반 토크나이징)
+                for st, docs in subtask_groups.items():
+                    tokenized_corpus = [d.page_content.split() for d in docs]
+                    self._bm25_indices[st] = BM25Okapi(tokenized_corpus)
+                    self._bm25_docs[st] = docs
+
+                print(f"BM25 인덱스 구축 완료: {len(subtask_groups)}개 subtask, "
+                      f"총 {sum(len(d) for d in subtask_groups.values())}건 문서")
+            except Exception as e:
+                print(f"BM25 인덱스 구축 실패 (벡터 검색만 사용): {e}")
+
+        print("Orchestrator + ReAct 에이전트 Pipe 등록 완료! (v4 운영환경)")
 
     # =================================================================
     # pipe() - Open WebUI가 사용자 메시지마다 호출하는 메인 엔트리포인트
@@ -226,8 +271,8 @@ class Pipe:
     #      + _generate_followups() : 후속 추천 질문 생성 (LLM 1회)
     #
     # 반환값:
-    #   - AsyncGenerator (스트리밍) 또는 Generator (이미지 포함 시)
-    #   - Open WebUI가 generator를 소비하여 프론트엔드에 실시간 전송
+    #   - StreamingResponse (SSE 스트리밍) 또는 Generator (이미지 포함 시)
+    #   - Open WebUI가 응답을 소비하여 프론트엔드에 실시간 전송
     # =================================================================
     async def pipe(
         self,
@@ -237,13 +282,20 @@ class Pipe:
         __request__: Request = None,       # FastAPI Request 객체
     ):
         try:
-            # ★ Lazy 초기화: 첫 호출 시에만 OpenAI/ChromaDB 클라이언트 생성
-            self._ensure_initialized()
             start_time = time.time()
             user_id = self._get_user_id(body, __user__)
             user_message = get_last_user_message(body["messages"])  # 마지막 사용자 메시지만 추출
             messages = body["messages"]       # 전체 대화 히스토리 (system, user, assistant 메시지)
             send_status = get_send_status(__event_emitter__)  # 상태 표시 유틸리티
+
+            # ── User 객체 resolve (generate_chat_completion에 필요) ──
+            user = Users.get_user_by_id(__user__["id"])
+
+            # ── 새 채팅 감지 ──
+            # 대화에서 user 메시지가 1개뿐이면 새 채팅으로 판단.
+            # 새 채팅 시 이전 분류 상태를 초기화하여 첫 진입(이미지 포함)으로 처리.
+            user_msg_count = sum(1 for m in messages if m.get("role") == "user")
+            is_new_chat = user_msg_count <= 1
 
             # ── 멀티턴 상태 관리 ──
             # 사용자별로 이전 분류 결과(도메인, 서브태스크)를 메모리에 보관.
@@ -255,6 +307,11 @@ class Pipe:
                 for k, v in list(self._state_by_user.items()):
                     if now - v.get("ts", 0) > self._state_ttl_sec:
                         del self._state_by_user[k]
+
+                # 새 채팅이면 이전 상태 초기화
+                if is_new_chat and user_id in self._state_by_user:
+                    del self._state_by_user[user_id]
+
                 # 현재 사용자의 이전 상태 로드
                 user_state = self._state_by_user.get(user_id, {})
                 last_classified = user_state.get("last_classified", "")  # 이전 서브태스크
@@ -271,10 +328,15 @@ class Pipe:
                 "event_emitter": __event_emitter__,  # 이벤트 콜백 (citation 전송용)
                 "send_status": send_status,       # 상태바 업데이트 함수
                 "start_time": start_time,         # 실행 시간 측정 시작점
+                # generate_chat_completion에 필요한 객체
+                "__request__": __request__,       # FastAPI Request 객체
+                "user": user,                     # Users 모델 객체
                 # _classify()가 채우는 분류 결과
                 "domain": "",                     # 도메인명 (예: "중고승용")
                 "subtask": "",                    # 서브태스크명 (예: "(론/할부)")
                 "is_requery": False,              # 재질의 여부 (분류 불가 시 True)
+                "requery_reason": "",             # 재질의 사유 (업무외/모호/정보부족)
+                "requery_detail": "",             # 재질의 상세 설명
                 # _react_agent()가 채우는 검색 결과
                 "filtered_docs": [],              # 관련성 높은 문서 리스트
                 # 멀티턴 판단용 이전 상태
@@ -326,9 +388,6 @@ class Pipe:
         history_summary = self._build_history_summary(state["messages"])
 
         # CLASSIFY_PROMPT에 변수 주입하여 분류 프롬프트 생성
-        # - history: 최근 대화 요약 (멀티턴 맥락)
-        # - last_domain/last_subtask: 직전 턴의 분류 결과 (연속성 판단)
-        # - question: 현재 사용자 질문
         prompt = CLASSIFY_PROMPT.format(
             history=history_summary,
             last_domain=state["last_domain"] or "없음",
@@ -336,16 +395,13 @@ class Pipe:
             question=state["user_message"],
         )
 
-        # LLM 호출 → JSON 응답 수신 (예: {"domain":"중고승용","subtask":"(론/할부)"})
-        content = await self._llm_call(prompt)
+        # LLM 호출 → JSON 응답 수신
+        content = await self._llm_call(prompt, state)
 
-        # JSON에서 domain, subtask 추출 + 유효성 검증
-        # (파싱 실패 시 텍스트에서 서브태스크 키워드를 탐색하는 폴백 로직 포함)
-        domain, subtask = self._parse_classification(content)
+        # JSON에서 domain, subtask, requery_reason, requery_detail 추출 + 유효성 검증
+        domain, subtask, requery_reason, requery_detail = self._parse_classification(content)
 
-        # 첫 진입 여부 판단:
-        # - 이전 분류 결과가 없거나 서브태스크가 변경되면 첫 진입
-        # - 첫 진입 시 이미지 포함 답변 생성 (중고승용 도메인만)
+        # 첫 진입 여부 판단
         is_first_entry = (
             state["last_classified"] == ""
             or state["last_classified"] != subtask
@@ -354,18 +410,18 @@ class Pipe:
         # state에 분류 결과 기록
         state["domain"] = domain
         state["subtask"] = subtask
-        state["is_requery"] = domain == "재질의"   # 분류 불가 → 재질의 경로
+        state["is_requery"] = domain == "재질의"
         state["is_first_entry"] = is_first_entry
+        state["requery_reason"] = requery_reason      # 업무외 / 모호 / 정보부족
+        state["requery_detail"] = requery_detail      # LLM이 작성한 재질의 사유
 
         if not state["is_requery"]:
-            # 분류 성공 시: 프론트엔드 상태바에 결과 표시 + 사용자 상태 저장
             display = DOMAIN_SUBTASK_MAP.get(domain, {}).get(
                 "display_name", domain
             )
             await send_status(
                 status_message=f"분류 결과 : {display} > {subtask}", done=True
             )
-            # 다음 턴의 멀티턴 연속성을 위해 분류 결과를 메모리에 저장
             await self._update_state(state["user_id"], domain, subtask)
 
         return state
@@ -377,18 +433,11 @@ class Pipe:
     # "행동(Act=벡터검색)"을 수행하고, "관찰(Observe=검색결과)"한 뒤,
     # 충분한 정보가 모이면 "완료(FINISH)"를 선언하는 자율 루프.
     #
-    # 기존 고정 파이프라인(검색→평가→생성)과 달리:
-    # - 에이전트가 검색 쿼리를 자율적으로 생성/정제
-    # - 검색 결과 부족 시 자동으로 추가 검색 (다른 키워드/서브태스크)
-    # - 관련 문서만 선별하여 filtered_docs에 저장
-    #
     # 최대 반복: REACT_MAX_ITERATIONS (기본 3회)
     # state 업데이트: filtered_docs
     # =================================================================
     async def _react_agent(self, state: dict) -> dict:
         """ReAct 루프: Think→Act→Observe 반복으로 관련 문서 수집"""
-        # observations: 각 검색 반복의 결과를 누적 저장
-        # 구조: [{"query": 검색어, "subtask": 대상, "docs": 원본문서, "doc_summaries": 요약}, ...]
         observations = []
         send_status = state["send_status"]
 
@@ -399,25 +448,21 @@ class Pipe:
             )
 
             # ── Think: LLM이 다음 행동을 결정 ──
-            # observations(이전 검색 결과)를 보고 SEARCH 또는 FINISH 판단
             decision = await self._react_step(state, observations)
 
             if decision["action"] == "FINISH":
                 # ── FINISH: 에이전트가 충분한 정보를 수집했다고 판단 ──
-                # LLM이 선택한 관련 문서 인덱스(relevant_doc_indices)로 필터링
                 relevant_indices = decision.get("relevant_doc_indices", [])
                 all_docs = []
                 for obs in observations:
                     all_docs.extend(obs["docs"])
 
-                # 에이전트가 지정한 인덱스의 문서만 선별
                 if relevant_indices and all_docs:
                     state["filtered_docs"] = [
                         all_docs[idx] for idx in relevant_indices
-                        if 0 <= idx < len(all_docs)  # 범위 초과 방지
+                        if 0 <= idx < len(all_docs)
                     ]
                 else:
-                    # 인덱스가 없으면 전체 문서 사용
                     state["filtered_docs"] = all_docs
 
                 # 안전장치: 필터링 후 0건이면 전체 문서로 폴백
@@ -427,27 +472,24 @@ class Pipe:
 
             elif decision["action"] == "SEARCH":
                 # ── Act: ChromaDB 벡터 검색 실행 ──
-                query = decision["query"]      # LLM이 생성한 검색 쿼리
-                subtask = decision["subtask"]  # LLM이 선택한 대상 서브태스크
+                query = decision["query"]
+                subtask = decision["subtask"]
 
                 await send_status(
                     status_message=f"{subtask} 검색 중: \"{query[:30]}...\"" if len(query) > 30 else f"{subtask} 검색 중: \"{query}\"",
                     done=False,
                 )
 
-                # 실제 벡터 검색 수행 (LLM 호출 없음, 순수 DB 쿼리)
                 docs = self._execute_tool(query, subtask)
 
                 # ── Observe: 검색 결과를 관측 기록에 추가 ──
-                # offset: 이전 검색에서 이미 쌓인 문서 수 (전체 인덱스 매핑용)
-                # 예: 1차 검색에서 5개 → 2차 검색 문서는 [문서5], [문서6], ... 으로 번호 매김
                 offset = sum(len(obs["docs"]) for obs in observations)
 
                 observations.append({
                     "query": query,
                     "subtask": subtask,
-                    "docs": docs,                    # 원본 Document 객체 (답변 생성에 사용)
-                    "doc_summaries": [               # 요약 텍스트 (다음 _react_step에 전달)
+                    "docs": docs,
+                    "doc_summaries": [
                         f"[문서{offset + j}] {d.page_content[:200]}"
                         for j, d in enumerate(docs)
                     ],
@@ -480,11 +522,8 @@ class Pipe:
         domain = state["domain"]
         subtask = state["subtask"]
         domain_info = DOMAIN_SUBTASK_MAP.get(domain, {})
-        # 현재 도메인에서 사용 가능한 모든 서브태스크 (교차 검색 허용)
         available_subtasks = ", ".join(domain_info.get("subtasks", [subtask]))
 
-        # 이전 검색 결과를 텍스트로 변환 (LLM에게 전달)
-        # 각 검색의 쿼리/서브태스크 + 문서 요약(200자)을 포함
         if observations:
             obs_text_parts = []
             for idx, obs in enumerate(observations):
@@ -504,38 +543,95 @@ class Pipe:
             question=state["user_message"],
         )
 
-        content = await self._llm_call(prompt)
-        # JSON 응답을 action dict로 변환 (파싱 실패 시 기본 검색 수행)
+        content = await self._llm_call(prompt, state)
         return self._parse_react_decision(content, state)
 
     # =================================================================
-    # _execute_tool() - 벡터 검색 도구 실행
+    # _execute_tool() - 하이브리드 검색 (벡터 + BM25 + RRF)
     # ---------------------------------------------------------------
-    # ChromaDB에서 similarity_search 수행 (코사인 유사도).
-    # metadata의 subtask 필드로 필터링하여 해당 서브태스크 문서만 검색.
-    # EMBEDDING_K(기본 5)개의 가장 유사한 문서를 반환.
+    # ENABLE_HYBRID_SEARCH=True 시:
+    #   1. 벡터 검색 (코사인 유사도) → 의미적 유사 문서 2K개
+    #   2. BM25 검색 (키워드 매칭) → 정확한 키워드 포함 문서 2K개
+    #   3. RRF (Reciprocal Rank Fusion) → 두 결과 결합 → 최종 K개
+    # ENABLE_HYBRID_SEARCH=False 시: 기존 벡터 검색만 사용
     # =================================================================
     def _execute_tool(self, query: str, subtask: str) -> list:
-        """ChromaDB 벡터 검색 (LLM 호출 없음, 순수 DB 쿼리)"""
-        return self.chroma_db_text.similarity_search(
-            query=query,                          # 검색 쿼리 (임베딩으로 변환됨)
-            k=self.valves.EMBEDDING_K,            # 반환할 문서 수
-            filter={"subtask": subtask},          # metadata 필터 (서브태스크별 검색)
+        """하이브리드 검색: 벡터(의미) + BM25(키워드) → RRF 결합"""
+        k = self.valves.EMBEDDING_K
+
+        # 하이브리드 비활성화 또는 BM25 인덱스 없음 → 벡터 검색만
+        if not self.valves.ENABLE_HYBRID_SEARCH or subtask not in self._bm25_indices:
+            return self.chroma_db_text.similarity_search(
+                query=query, k=k, filter={"subtask": subtask},
+            )
+
+        # 후보를 넓게 가져오기 (최종 K개보다 2배)
+        search_k = k * 2
+
+        # ── 1) 벡터 검색 (의미적 유사도) ──
+        vector_results = self.chroma_db_text.similarity_search(
+            query=query, k=search_k, filter={"subtask": subtask},
         )
 
+        # ── 2) BM25 검색 (키워드 매칭) ──
+        tokenized_query = query.split()
+        bm25 = self._bm25_indices[subtask]
+        bm25_docs_all = self._bm25_docs[subtask]
+        scores = bm25.get_scores(tokenized_query)
+
+        # 점수 > 0인 문서만 상위 search_k개 선별
+        scored_indices = [
+            (idx, sc) for idx, sc in enumerate(scores) if sc > 0
+        ]
+        scored_indices.sort(key=lambda x: x[1], reverse=True)
+        bm25_results = [bm25_docs_all[idx] for idx, _ in scored_indices[:search_k]]
+
+        # ── 3) RRF 결합 ──
+        return self._rrf_merge(vector_results, bm25_results, k)
+
     # =================================================================
-    # _generate() - 최종 답변 생성 (스트리밍)
+    # _rrf_merge() - Reciprocal Rank Fusion
+    # ---------------------------------------------------------------
+    # 두 검색 결과의 순위를 결합하는 알고리즘.
+    # 공식: score(d) = Σ 1/(K + rank_i) (각 검색에서의 순위 rank_i)
+    # K(RRF_K)가 클수록 상위/하위 순위 차이가 줄어들어 결과가 균등해짐.
+    # 양쪽 검색에서 모두 상위에 있는 문서가 높은 점수를 받음.
+    # =================================================================
+    def _rrf_merge(self, vector_docs: list, bm25_docs: list, k: int) -> list:
+        """벡터 + BM25 결과를 RRF로 결합하여 상위 k개 반환"""
+        rrf_k = self.valves.RRF_K
+        doc_scores = {}    # page_content → RRF 점수
+        doc_objects = {}   # page_content → Document 객체
+
+        for rank, doc in enumerate(vector_docs):
+            key = doc.page_content
+            doc_scores[key] = doc_scores.get(key, 0) + 1 / (rrf_k + rank + 1)
+            doc_objects[key] = doc
+
+        for rank, doc in enumerate(bm25_docs):
+            key = doc.page_content
+            doc_scores[key] = doc_scores.get(key, 0) + 1 / (rrf_k + rank + 1)
+            if key not in doc_objects:
+                doc_objects[key] = doc
+
+        # RRF 점수 내림차순 정렬 → 상위 k개 반환
+        sorted_keys = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+        return [doc_objects[key] for key in sorted_keys[:k]]
+
+    # =================================================================
+    # _generate() - 최종 답변 생성 (StreamingResponse 인터셉트)
     # ---------------------------------------------------------------
     # ReAct 에이전트가 수집한 문서(filtered_docs)를 참고자료로 활용하여
-    # 사용자 질문에 대한 최종 답변을 OpenAI 스트리밍으로 생성.
+    # 사용자 질문에 대한 최종 답변을 generate_chat_completion(stream=True)으로 생성.
+    # StreamingResponse의 body_iterator를 인터셉트하여 prefix/suffix/후속질문 주입.
     #
-    # 출력 구조 (순서대로 yield):
+    # 출력 구조 (SSE 청크 순서):
     #   1. prefix: "#### [중고승용 운영기준 > (론/할부)]"
     #   2. LLM 스트리밍 답변 (토큰 단위로 실시간 전송)
     #   3. suffix: "**[중고승용 운영기준입니다. 다른 운영기준이 필요한 경우...]**"
     #   4. 후속 추천 질문 (ENABLE_FOLLOWUPS=True일 때)
     #
-    # 반환값: AsyncGenerator (Open WebUI가 소비하여 프론트엔드에 전달)
+    # 반환값: StreamingResponse (SSE)
     #
     # 분기: 첫 진입 + 이미지 도메인(중고승용) → _generate_with_image()로 위임
     # =================================================================
@@ -551,17 +647,14 @@ class Pipe:
         )
 
         # ── 이미지 경로 분기 ──
-        # 해당 서브태스크 첫 진입 + 이미지가 있는 도메인(중고승용) → 이미지 포함 답변
         if state["is_first_entry"] and DOMAIN_SUBTASK_MAP.get(domain, {}).get("has_image", False):
             return await self._generate_with_image(state)
 
         # ── 참고자료 컨텍스트 구성 ──
-        # filtered_docs의 page_content를 [참고자료 1], [참고자료 2]... 형태로 연결
         context = "\n\n".join(
             [f"[참고자료 {i+1}]\n{doc.page_content}" for i, doc in enumerate(filtered_docs)]
         )
 
-        # GENERATE_PROMPT에 변수 주입 (도메인, 서브태스크, 대화이력, 참고자료, 질문)
         prompt = GENERATE_PROMPT.format(
             domain=display_name,
             subtask=subtask,
@@ -576,7 +669,6 @@ class Pipe:
         await send_status(status_message=f"완료: {exe_time:.2f}초", done=True)
 
         # ── 출처(citation) 전송 ──
-        # 각 참고자료를 citation 이벤트로 전송 → 프론트엔드 답변 하단에 출처 카드 표시
         send_citation = get_send_citation(state["event_emitter"])
         for idx, doc in enumerate(filtered_docs, start=1):
             await send_citation(
@@ -585,44 +677,95 @@ class Pipe:
                 content=doc.page_content,
             )
 
-        # ── AsyncGenerator 구성: 스트리밍 응답 ──
-        # Open WebUI는 이 generator를 소비하여 각 토큰을 프론트엔드에 SSE로 전송.
+        # ── StreamingResponse 인터셉트: prefix/suffix/후속질문 주입 ──
         prefix = f"#### [{display_name} > {subtask}]\n"
         suffix = f"\n\n **[{display_name}입니다. 다른 운영기준이 필요한 경우 '새 채팅'을 이용해주세요.]**"
 
-        async def stream_response():
-            # 1) 헤더 출력 (도메인 > 서브태스크)
-            yield prefix
+        data_json = {
+            "model": self.valves.LLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "temperature": 0,
+        }
+        original_response = await generate_chat_completion(
+            state["__request__"], data_json, state["user"]
+        )
 
-            # 2) OpenAI 스트리밍 답변 (토큰 단위 실시간 전송)
-            collected_answer = []  # 후속 질문 생성을 위해 답변 텍스트 캡처
-            stream = await self.openai_client.chat.completions.create(
-                model=self.valves.OPENAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                stream=True,
-                temperature=0,    # 결정론적 출력 (운영기준 안내이므로 창의성 불필요)
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    collected_answer.append(delta.content)
-                    yield delta.content   # 프론트엔드에 토큰 실시간 전송
+        # state를 클로저 캡처하여 후속질문 생성에 사용
+        _state = state
+        _self = self
 
-            # 3) 안내 문구 출력
-            yield suffix
+        async def stream_with_extras():
+            prefix_sent = False
+            collected_answer = []
+            async for chunk in original_response.body_iterator:
+                decoded_chunk = (
+                    chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                )
+                if decoded_chunk.startswith("data:"):
+                    json_data = decoded_chunk.lstrip("data:").strip()
+                    try:
+                        data = json.loads(json_data)
+                        choices = data.get("choices", [])
+                        for choice in choices:
+                            content = choice.get("delta", {}).get("content")
+                            if content is not None:
+                                # 답변 텍스트 캡처 (후속질문 생성용)
+                                collected_answer.append(content)
+                                if not prefix_sent:
+                                    # 첫 번째 content 청크에 prefix 주입
+                                    choice["delta"]["content"] = prefix + content
+                                    prefix_sent = True
+                                    break
 
-            # 4) 후속 추천 질문 생성 (v3 기능)
-            # 스트리밍 완료 후 1회 추가 LLM 호출로 추천 질문 3개 생성
-            if self.valves.ENABLE_FOLLOWUPS:
-                full_answer = "".join(collected_answer)
-                follow_ups = await self._generate_followups(state, full_answer)
+                        modified_chunk = (
+                            f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                        )
+                        yield modified_chunk.encode("utf-8")
+                    except json.JSONDecodeError:
+                        yield chunk
+                else:
+                    yield chunk
+
+            # suffix 청크 yield
+            suffix_data = {
+                "choices": [{"delta": {"content": suffix}}]
+            }
+            suffix_chunk = f"data: {json.dumps(suffix_data, ensure_ascii=False)}\n\n"
+            yield suffix_chunk.encode("utf-8")
+
+            # 후속 추천 질문 생성 (v3 기능)
+            full_answer = "".join(collected_answer)
+            if _self.valves.ENABLE_FOLLOWUPS:
+                follow_ups = await _self._generate_followups(_state, full_answer)
                 if follow_ups:
                     followup_text = "\n\n---\n**추천 질문:**\n"
                     for idx, q in enumerate(follow_ups, 1):
                         followup_text += f"{idx}. {q}\n"
-                    yield followup_text
+                    followup_data = {
+                        "choices": [{"delta": {"content": followup_text}}]
+                    }
+                    followup_chunk = f"data: {json.dumps(followup_data, ensure_ascii=False)}\n\n"
+                    yield followup_chunk.encode("utf-8")
 
-        return stream_response()
+            # 답변 신뢰도 검증 (v5 기능)
+            if _self.valves.ENABLE_GROUNDING_CHECK and full_answer:
+                grounding = await _self._check_grounding(_state, full_answer)
+                if grounding:
+                    score = grounding["score"]
+                    reason = grounding["reason"]
+                    filled = int(score / 10)
+                    bar = "\u25a0" * filled + "\u25a1" * (10 - filled)
+                    grounding_text = f"\n\n---\n**[답변 신뢰도: {bar} {score}%]** {reason}"
+                    grounding_data = {
+                        "choices": [{"delta": {"content": grounding_text}}]
+                    }
+                    grounding_chunk = f"data: {json.dumps(grounding_data, ensure_ascii=False)}\n\n"
+                    yield grounding_chunk.encode("utf-8")
+
+        return StreamingResponse(
+            stream_with_extras(), media_type="text/plain; charset=utf-8"
+        )
 
     # =================================================================
     # _generate_with_image() - 이미지 포함 답변 생성 (non-streaming)
@@ -648,8 +791,6 @@ class Pipe:
         )
 
         # ── 이미지 검색 ──
-        # ChromaDB 이미지 컬렉션에서 서브태스크에 해당하는 이미지 URL 검색
-        # metadata의 html_images 필드에 이미지 URL 저장되어 있음
         image_results = self.chroma_db_image.similarity_search(
             query=subtask, k=1
         )
@@ -678,8 +819,18 @@ class Pipe:
         exe_time = end_time - state["start_time"]
         await send_status(status_message=f"완료: {exe_time:.2f}초", done=True)
 
+        # ── 출처(citation) 전송 ──
+        # 이미지 경로에서도 참고자료 출처를 프론트엔드에 전달
+        send_citation = get_send_citation(state["event_emitter"])
+        for idx, doc in enumerate(filtered_docs, start=1):
+            await send_citation(
+                url=f"출처{idx}",
+                title=f"출처{idx}",
+                content=doc.page_content,
+            )
+
         # non-streaming LLM 호출 (이미지와 조합해야 하므로 전체 텍스트 한번에 생성)
-        llm_text = await self._llm_call(prompt)
+        llm_text = await self._llm_call(prompt, state)
 
         # ── 후속 추천 질문 생성 (v3 기능) ──
         followup_text = ""
@@ -690,8 +841,19 @@ class Pipe:
                 for idx, q in enumerate(follow_ups, 1):
                     followup_text += f"{idx}. {q}\n"
 
-        # ── 최종 출력 조합: 헤더 + 이미지 + LLM답변 + 후속질문 ──
-        combined = f"#### [{display_name} > {subtask}]\n{image_url}\n{llm_text}{followup_text}"
+        # ── 답변 신뢰도 검증 (v5 기능) ──
+        grounding_text = ""
+        if self.valves.ENABLE_GROUNDING_CHECK and llm_text:
+            grounding = await self._check_grounding(state, llm_text)
+            if grounding:
+                score = grounding["score"]
+                reason = grounding["reason"]
+                filled = int(score / 10)
+                bar = "\u25a0" * filled + "\u25a1" * (10 - filled)
+                grounding_text = f"\n\n---\n**[답변 신뢰도: {bar} {score}%]** {reason}"
+
+        # ── 최종 출력 조합: 헤더 + 이미지 + LLM답변 + 후속질문 + 신뢰도 ──
+        combined = f"#### [{display_name} > {subtask}]\n{image_url}\n{llm_text}{followup_text}{grounding_text}"
 
         # sync generator: 문자 단위로 yield하여 타이핑 효과 구현
         def stream_output():
@@ -722,13 +884,10 @@ class Pipe:
             domain_info = DOMAIN_SUBTASK_MAP.get(domain, {})
             display_name = domain_info.get("display_name", domain)
 
-            # 기존 검색 결과로 context 구성 (추가 벡터 검색 없음)
             context = "\n\n".join(
                 [f"[참고자료 {i+1}]\n{doc.page_content}" for i, doc in enumerate(filtered_docs)]
             )
 
-            # 같은 도메인 내 다른 서브태스크 목록 추출
-            # 예: 현재 (론/할부) → 다른: (임직원대출), (신용구제), (Dual Offer), (엔카)
             all_subtasks = domain_info.get("subtasks", [])
             other_subtasks = [s for s in all_subtasks if s != subtask]
             other_subtasks_str = ", ".join(other_subtasks) if other_subtasks else "없음"
@@ -739,65 +898,92 @@ class Pipe:
                 other_subtasks=other_subtasks_str,
                 context=context,
                 question=state["user_message"],
-                answer=answer[:2000],  # 답변이 너무 길면 2000자로 잘라서 전달
+                answer=answer[:2000],
             )
 
-            content = await self._llm_call(prompt)
+            content = await self._llm_call(prompt, state)
 
-            # JSON 응답 파싱: {"follow_ups": ["질문1", "질문2", "질문3"]}
             cleaned = re.sub(r"```(?:json)?", "", content).strip().strip("`")
             data = json.loads(cleaned)
             follow_ups = data.get("follow_ups", [])
 
-            # 최대 3개까지만 반환
             if isinstance(follow_ups, list) and len(follow_ups) >= 1:
                 return [str(q) for q in follow_ups[:3]]
             return []
 
         except Exception as e:
-            # 후속 질문 생성 실패 시 빈 리스트 반환 (답변은 이미 완료되었으므로 무시)
             print(f"[Followup generation error] {e}")
             return []
 
     # =================================================================
-    # _requery() - 재질의 응답 생성 (스트리밍)
+    # _check_grounding() - 답변 신뢰도 검증 (v5 기능)
+    # ---------------------------------------------------------------
+    # 생성된 답변이 참고자료에 근거하는지 검증하여 1~10점 신뢰도를 반환.
+    # LLM 1회 추가 호출. 에러 시 None 반환 (답변에 영향 없음).
+    #
+    # 반환: {"score": int, "reason": str} 또는 None
+    # =================================================================
+    async def _check_grounding(self, state: dict, answer: str) -> dict | None:
+        """답변 신뢰도 검증 (1 LLM call, non-streaming)"""
+        try:
+            filtered_docs = state.get("filtered_docs", [])
+            context = "\n\n".join(
+                [f"[참고자료 {i+1}]\n{doc.page_content}" for i, doc in enumerate(filtered_docs)]
+            )
+
+            prompt = GROUNDING_CHECK_PROMPT.format(
+                context=context,
+                question=state["user_message"],
+                answer=answer[:3000],
+            )
+
+            content = await self._llm_call(prompt, state)
+
+            cleaned = re.sub(r"```(?:json)?", "", content).strip().strip("`")
+            data = json.loads(cleaned)
+            score = float(data.get("score", 0))
+            reason = str(data.get("reason", ""))
+
+            if 0.0 <= score <= 100.0:
+                return {"score": round(score, 1), "reason": reason}
+            return None
+
+        except Exception as e:
+            print(f"[Grounding check error] {e}")
+            return None
+
+    # =================================================================
+    # _requery() - 재질의 응답 생성 (StreamingResponse 직접 반환)
     # ---------------------------------------------------------------
     # _classify()에서 domain="재질의"로 판단된 경우 호출.
     # RAG 검색 없이 LLM만으로 안내 메시지를 생성하여 사용자에게 반환.
-    #
-    # 사용 사례:
-    #   - "운영기준 알려줘" (범위가 너무 넓음) → 구체적 질문 예시 제공
-    #   - "날씨 어때?" (업무 외 질문) → 지원 업무 영역 안내
-    #   - 키워드가 모호하여 도메인/서브태스크를 특정할 수 없는 경우
+    # generate_chat_completion(stream=True) 반환값을 그대로 반환.
     # =================================================================
     async def _requery(self, state: dict):
         send_status = state["send_status"]
         await send_status(status_message="재질의 응답 생성 중...", done=False)
 
-        # REQUERY_PROMPT: 지원 업무 영역 목록 + 추천 질문 예시를 포함하는 프롬프트
         prompt = REQUERY_PROMPT.format(
             history=str(state["messages"][-6:]),
             question=state["user_message"],
+            requery_reason=state.get("requery_reason", "모호"),
+            requery_detail=state.get("requery_detail", ""),
         )
 
         end_time = time.time()
         exe_time = end_time - state["start_time"]
         await send_status(status_message=f"완료: {exe_time:.2f}초", done=True)
 
-        # OpenAI 스트리밍 → AsyncGenerator로 반환
-        async def stream_response():
-            stream = await self.openai_client.chat.completions.create(
-                model=self.valves.OPENAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                stream=True,
-                temperature=0,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    yield delta.content
-
-        return stream_response()
+        data_json = {
+            "model": self.valves.LLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "temperature": 0,
+        }
+        response = await generate_chat_completion(
+            state["__request__"], data_json, state["user"]
+        )
+        return response  # StreamingResponse 그대로 반환
 
     # =================================================================
     # 유틸리티 함수
@@ -805,33 +991,22 @@ class Pipe:
 
     # -----------------------------------------------------------------
     # _llm_call() - 단일 프롬프트 LLM 호출 (non-streaming)
+    # generate_chat_completion을 사용하여 LLM 호출.
     # 분류, ReAct, 후속질문 등 JSON 응답이 필요한 곳에서 사용.
     # temperature=0으로 결정론적 출력 보장.
     # -----------------------------------------------------------------
-    async def _llm_call(self, prompt: str) -> str:
+    async def _llm_call(self, prompt: str, state: dict) -> str:
         """non-stream LLM 호출 (단일 프롬프트) → 텍스트 반환"""
-        response = await self.openai_client.chat.completions.create(
-            model=self.valves.OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-            temperature=0,
+        data_json = {
+            "model": self.valves.LLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0,
+        }
+        response = await generate_chat_completion(
+            state["__request__"], data_json, state["user"]
         )
-        return response.choices[0].message.content
-
-    # -----------------------------------------------------------------
-    # _llm_call_messages() - messages 배열 기반 LLM 호출 (non-streaming)
-    # system/user/assistant 역할이 구분된 대화형 프롬프트에 사용.
-    # 현재 코드에서는 직접 사용되지 않지만, 확장 시 활용 가능.
-    # -----------------------------------------------------------------
-    async def _llm_call_messages(self, messages: list) -> str:
-        """non-stream LLM 호출 (messages 배열) → 텍스트 반환"""
-        response = await self.openai_client.chat.completions.create(
-            model=self.valves.OPENAI_MODEL,
-            messages=messages,
-            stream=False,
-            temperature=0,
-        )
-        return response.choices[0].message.content
+        return response["choices"][0]["message"]["content"]
 
     # -----------------------------------------------------------------
     # _get_user_id() - 사용자 ID 추출
@@ -852,9 +1027,9 @@ class Pipe:
     async def _update_state(self, user_id: str, domain: str, subtask: str) -> None:
         async with self._state_lock:
             self._state_by_user[user_id] = {
-                "last_classified": subtask,    # 이전 서브태스크 (멀티턴 연속성)
-                "last_domain": domain,         # 이전 도메인
-                "ts": time.time(),             # TTL 체크용 타임스탬프
+                "last_classified": subtask,
+                "last_domain": domain,
+                "ts": time.time(),
             }
 
     # -----------------------------------------------------------------
@@ -869,11 +1044,10 @@ class Pipe:
             return "없음 (첫 질문)"
 
         history_parts = []
-        recent = messages[-7:-1]  # 최근 6개 메시지 (마지막=현재 질문 제외)
+        recent = messages[-7:-1]
         for msg in recent:
             role = msg.get("role", "")
             content = msg.get("content", "")
-            # 긴 메시지는 앞뒤만 남기고 중략 처리 (프롬프트 토큰 절약)
             if len(content) > 300:
                 content = content[:150] + "\n...(중략)...\n" + content[-150:]
             history_parts.append(f"[{role}] {content}")
@@ -882,59 +1056,39 @@ class Pipe:
 
     # -----------------------------------------------------------------
     # _parse_classification() - 분류 LLM 응답 JSON 파싱
-    # ---------------------------------------------------------------
-    # LLM 응답에서 domain, subtask를 추출하고 유효성 검증.
-    #
-    # 파싱 전략 (우선순위):
-    #   1) JSON 파싱 → DOMAIN_SUBTASK_MAP에서 유효성 검증
-    #   2) subtask 불일치 시 → 괄호 제거 후 부분 매칭 시도
-    #   3) 서브태스크 1개뿐인 도메인 → 자동 매핑
-    #   4) JSON 파싱 실패 → 텍스트에서 서브태스크 키워드 탐색 (폴백)
-    #   5) 모든 방법 실패 → ("재질의", "재질의") 반환
     # -----------------------------------------------------------------
     def _parse_classification(self, content: str) -> tuple:
-        """분류 LLM 응답에서 domain, subtask 파싱 + 유효성 검증"""
+        """분류 LLM 응답에서 domain, subtask, requery_reason, requery_detail 파싱 + 유효성 검증"""
         try:
-            # 코드블록(```json ... ```) 제거 후 순수 JSON 추출
             cleaned = re.sub(r"```(?:json)?", "", content).strip().strip("`")
             data = json.loads(cleaned)
             domain = data.get("domain", "재질의")
             subtask = data.get("subtask", "재질의")
+            requery_reason = data.get("requery_reason", "모호")
+            requery_detail = data.get("requery_detail", "")
 
-            # 도메인이 유효한지 확인
             if domain in DOMAIN_SUBTASK_MAP:
                 valid_subtasks = DOMAIN_SUBTASK_MAP[domain]["subtasks"]
                 if subtask not in valid_subtasks:
-                    # subtask가 정확히 일치하지 않으면 부분 매칭 시도
-                    # 예: LLM이 "론/할부"로 응답 → "(론/할부)"로 보정
                     for vs in valid_subtasks:
                         if subtask.replace("(", "").replace(")", "") in vs:
                             subtask = vs
                             break
                     else:
-                        # 서브태스크가 1개뿐인 도메인(중고리스, 중형트럭) → 자동 매핑
                         if len(valid_subtasks) == 1:
                             subtask = valid_subtasks[0]
-                return domain, subtask
+                return domain, subtask, "", ""
             else:
-                # 알 수 없는 도메인 → 재질의
-                return "재질의", "재질의"
+                return "재질의", "재질의", requery_reason, requery_detail
         except (json.JSONDecodeError, KeyError, AttributeError):
-            # JSON 파싱 실패 → 텍스트에서 서브태스크 키워드 직접 탐색 (폴백)
             for domain, info in DOMAIN_SUBTASK_MAP.items():
                 for st in info["subtasks"]:
                     if st in content:
-                        return domain, st
-            return "재질의", "재질의"
+                        return domain, st, "", ""
+            return "재질의", "재질의", "모호", ""
 
     # -----------------------------------------------------------------
     # _parse_react_decision() - ReAct Step LLM 응답 JSON 파싱
-    # ---------------------------------------------------------------
-    # LLM 응답에서 action(SEARCH/FINISH)을 추출.
-    #
-    # SEARCH 시: query(검색어), subtask(대상) 추출 + subtask 유효성 검증
-    # FINISH 시: relevant_doc_indices(관련 문서 번호) 추출
-    # 파싱 실패 시: 기본 검색 수행 (사용자 원문으로 현재 서브태스크 검색)
     # -----------------------------------------------------------------
     def _parse_react_decision(self, content: str, state: dict) -> dict:
         """ReAct Step LLM 응답에서 action dict 파싱"""
@@ -947,23 +1101,19 @@ class Pipe:
                 query = data.get("query", state["user_message"])
                 subtask = data.get("subtask", state["subtask"])
 
-                # subtask 유효성 검증 (LLM이 잘못된 서브태스크를 지정할 수 있음)
                 domain_info = DOMAIN_SUBTASK_MAP.get(state["domain"], {})
                 valid_subtasks = domain_info.get("subtasks", [])
                 if subtask not in valid_subtasks:
-                    # 부분 매칭 시도 (괄호 제거 후 비교)
                     for vs in valid_subtasks:
                         if subtask.replace("(", "").replace(")", "") in vs:
                             subtask = vs
                             break
                     else:
-                        # 매칭 실패 → 원래 분류된 서브태스크로 폴백
                         subtask = state["subtask"]
 
                 return {"action": "SEARCH", "query": query, "subtask": subtask}
 
             elif action == "FINISH":
-                # 관련 문서 인덱스 추출 (정수만 필터링)
                 relevant_indices = data.get("relevant_doc_indices", [])
                 return {
                     "action": "FINISH",
@@ -973,11 +1123,9 @@ class Pipe:
                 }
 
             else:
-                # 알 수 없는 action → 안전하게 FINISH로 처리
                 return {"action": "FINISH", "relevant_doc_indices": []}
 
         except (json.JSONDecodeError, KeyError, AttributeError):
-            # JSON 파싱 실패 → 사용자 원문으로 기본 검색 수행
             return {
                 "action": "SEARCH",
                 "query": state["user_message"],
@@ -1007,10 +1155,6 @@ class Pipe:
 # --------------------------------------------------------------------------
 # 입력 변수: {history}, {last_domain}, {last_subtask}, {question}
 # 출력: JSON {"domain": "...", "subtask": "..."}
-#
-# 4개 도메인 × 12개 서브태스크의 정의/키워드를 프롬프트에 포함하여
-# LLM이 정확한 분류를 할 수 있도록 유도.
-# 멀티턴 규칙: 이전 분류 결과를 참조하여 연속된 문의를 동일 카테고리로 유지.
 # ==========================================================================
 CLASSIFY_PROMPT = """당신은 사용자의 질문을 **도메인**과 **서브태스크**로 분류하는 모델입니다.
 아래 **도메인·서브태스크 정의**와 **분류 규칙**을 정확히 따르고, 가능한 경우 이전 대화 히스토리에서 최근 업무를 확인해 연속된 문의인지 판단하십시오.
@@ -1068,7 +1212,10 @@ CLASSIFY_PROMPT = """당신은 사용자의 질문을 **도메인**과 **서브�
    - 예: 1) "론할부 운영기준 알려줘" → 중고승용/(론/할부)  2) "nice 등급은?" → 중고승용/(론/할부) (유지)
    - 예: 1) "론할부 운영기준 알려줘" → 중고승용/(론/할부)  2) "신용구제 금리는?" → 중고승용/(신용구제) (전환)
    - 예: 1) "론할부 운영기준 알려줘" → 중고승용/(론/할부)  2) "재고금융 한도는?" → 전략금융/(재고금융) (전환)
-3. 분류 불가하거나 너무 모호한 질문: domain="재질의", subtask="재질의"
+3. **재질의 판단**: 아래 3가지 경우에 해당하면 domain="재질의", subtask="재질의"로 분류하고, requery_reason을 반드시 포함하세요.
+   - **"업무외"**: 지원 업무 영역(중고승용/전략금융/중고리스/중형트럭)과 전혀 관련 없는 질문 (예: "날씨 어때?", "점심 추천해줘")
+   - **"모호"**: 업무와 관련될 수 있으나 범위가 너무 넓거나 도메인/서브태스크를 특정할 수 없는 질문 (예: "운영기준 알려줘", "금리 알려줘")
+   - **"정보부족"**: 도메인은 유추 가능하나, 정확한 답변을 위해 추가 정보(상품유형, 고객유형, 등급, 금액 등)가 필요한 질문 (예: "대출 한도가 얼마야?", "수수료율 알려줘")
 
 ### 이전 대화 맥락
 - 이전 도메인: {last_domain}
@@ -1081,8 +1228,14 @@ CLASSIFY_PROMPT = """당신은 사용자의 질문을 **도메인**과 **서브�
 {question}
 
 ### 출력 형식 (JSON만 출력, 다른 텍스트 없이)
+분류 성공 시:
 ```json
-{{"domain": "중고승용|전략금융|중고리스|중형트럭|재질의", "subtask": "(론/할부)|(임직원대출)|(신용구제)|(Dual Offer)|(엔카)|(재고금융)|(제휴점 운영자금)|(매매상사 운영자금)|(운영자금 자금용도 기준)|(임차보증금)|(중고리스)|(중형트럭)|(재질의)"}}
+{{"domain": "중고승용|전략금융|중고리스|중형트럭", "subtask": "(론/할부)|(임직원대출)|..."}}
+```
+
+재질의 시 (반드시 requery_reason 포함):
+```json
+{{"domain": "재질의", "subtask": "재질의", "requery_reason": "업무외|모호|정보부족", "requery_detail": "재질의 사유를 한 문장으로 설명"}}
 ```"""
 
 
@@ -1091,10 +1244,6 @@ CLASSIFY_PROMPT = """당신은 사용자의 질문을 **도메인**과 **서브�
 # --------------------------------------------------------------------------
 # 입력 변수: {domain}, {subtask}, {available_subtasks}, {observations}, {question}
 # 출력: JSON {"action": "SEARCH"/"FINISH", ...}
-#
-# LLM에게 이전 검색 결과를 보여주고, 추가 검색이 필요한지 판단하게 함.
-# SEARCH: 새로운 query + subtask로 추가 검색 지시
-# FINISH: 관련 문서 인덱스를 지정하고 답변 생성 단계로 이동
 # ==========================================================================
 REACT_STEP_PROMPT = """당신은 JB우리캐피탈 오토운영팀의 정보 검색 에이전트입니다.
 사용자 질문에 답하기 위해 벡터 검색 도구를 사용하여 관련 문서를 수집합니다.
@@ -1139,9 +1288,6 @@ REACT_STEP_PROMPT = """당신은 JB우리캐피탈 오토운영팀의 정보 검
 # --------------------------------------------------------------------------
 # 입력 변수: {domain}, {subtask}, {history}, {context}, {question}
 # 출력: 자연어 한국어 답변 (마크다운 형식)
-#
-# RAG 패턴: 검색된 참고자료(context)를 기반으로 답변 생성.
-# 답변 지침: 인사 금지, 한국어, 가독성(줄바꿈, 볼드), 간결한 답변.
 # ==========================================================================
 GENERATE_PROMPT = """너는 JB우리캐피탈 오토운영팀 챗봇이야.
 현재 업무 영역: {domain} > {subtask}
@@ -1154,6 +1300,12 @@ GENERATE_PROMPT = """너는 JB우리캐피탈 오토운영팀 챗봇이야.
 <지침>
 1. 제공되는 참고자료를 참고하여 적합한 답변을 생성하고 DocumentID 같은 IT 단어는 사용하지마
 2. 사용자 질문이 너무 광범위할 경우, 구체적으로 알려달라고 요청해.
+
+<답변 근거 원칙 - 반드시 준수>
+1. **참고자료에 있는 정보만** 사용하여 답변을 생성해. 참고자료에 없는 내용은 절대 포함하지 마.
+2. 숫자, 비율, 등급, 금리, 기간, 한도 등 **구체적 수치는 반드시 참고자료에서 확인된 것만** 사용해.
+3. 일반 상식이나 추측으로 답변을 보충하지 마. 참고자료에 없으면 "해당 정보는 현재 참고자료에서 확인되지 않습니다"라고 명시해.
+4. 참고자료의 내용을 **왜곡하거나 확대 해석**하지 마. 원문의 의미를 그대로 전달해.
 
 <답변 가독성>
 1. 답변 작성시 가독성을 위해 문장이 끝나면 줄바꿈 처리하고, 답변이 길어지면 글머리 기호를 줘서 가독성을 높여줘.
@@ -1175,25 +1327,52 @@ GENERATE_PROMPT = """너는 JB우리캐피탈 오토운영팀 챗봇이야.
 # ==========================================================================
 # REQUERY_PROMPT - 재질의 안내 프롬프트
 # --------------------------------------------------------------------------
-# 입력 변수: {history}, {question}
-# 출력: 자연어 한국어 안내 메시지 (추천 질문 포함)
-#
-# 분류 불가 시 사용. 지원 업무 영역 목록을 안내하고 구체적 질문을 유도.
+# 입력 변수: {history}, {question}, {requery_reason}, {requery_detail}
+# 출력: 자연어 한국어 안내 메시지 (상황별 맞춤 안내 + 추천 질문)
 # ==========================================================================
 REQUERY_PROMPT = """너는 JB우리캐피탈 오토운영팀 챗봇이야.
-지금 사용자가 업무 분류에 벗어난 질문을 한 상태야.
-재질문으로 사용자에게 다시 입력을 유도해.
+사용자의 질문에 바로 답변하기 어려운 상황이야. 아래 재질의 사유를 참고해서 사용자에게 적절히 안내해줘.
 
-우리가 지원하는 업무 영역은 다음과 같아:
+### 재질의 사유
+- 유형: {requery_reason}
+- 상세: {requery_detail}
+
+### 우리가 지원하는 업무 영역
 - **중고승용**: 론/할부, 임직원대출(ESM), 신용구제, Dual Offer, 엔카
 - **전략금융**: 재고금융, 제휴점 운영자금, 매매상사 운영자금, 운영자금 자금용도 기준, 임차보증금
 - **중고리스**: 중고리스
 - **중형트럭**: 중형트럭
 
-사용자 질문이나 대화내용을 참고해서 더 나은 질문에 대해서 답변해줘.
-예를들어 "운영기준 알려줘"와 같은 너무 넓은 범위 질문이 들어오면,
-추천질문으로 "론/할부 운영기준 알려줘", "재고금융 운영기준 알려줘" 와 같은 추천질문을 제공해줘.
-너는 반드시 "한국어"로 답변해.
+### 상황별 응답 지침
+
+**1) 유형이 "업무외"인 경우:**
+- 해당 질문은 지원 범위 밖임을 친절하게 안내
+- 우리가 지원하는 업무 영역을 간결하게 소개
+- 사용자가 궁금해할 만한 업무 관련 추천 질문 2~3개를 제시
+- 예시: "해당 질문은 오토운영팀 지원 범위에 포함되지 않습니다. 아래와 같은 질문을 해보시겠어요?"
+
+**2) 유형이 "모호"인 경우:**
+- 질문의 의도를 파악하려 노력하고, 어떤 정보를 구체적으로 알려주면 더 정확한 답변이 가능한지 안내
+- 사용자의 질문 키워드와 관련될 수 있는 업무 영역을 추려서 추천 질문으로 제시
+- 추천 질문은 사용자가 바로 복사해서 질문할 수 있도록 구체적으로 작성
+- 예시: "'금리'에 대해 문의하셨는데, 어떤 상품의 금리가 궁금하신가요? 아래에서 선택해주세요."
+
+**3) 유형이 "정보부족"인 경우:**
+- 질문의 의도는 이해했으나, 정확한 답변을 위해 추가로 필요한 정보가 무엇인지 구체적으로 안내
+- 필요한 정보 항목을 목록으로 제시 (예: 상품유형, 고객유형, NICE등급, 대출금액, 차량연식 등)
+- 추천 질문은 필요한 정보를 포함한 완성된 형태로 제시
+- 예시: "론/할부 금리를 안내해드리려면 아래 정보가 필요합니다: ① NICE등급 ② 대출기간 ③ 고객유형(개인/법인)"
+
+### 추천 질문 작성 규칙
+1. 추천 질문은 반드시 **2~3개** 제시
+2. 사용자가 **바로 입력할 수 있는 완성된 질문** 형태로 작성 (예: "론/할부 NICE등급별 금리 알려줘")
+3. 사용자의 원래 질문 의도와 **연관성이 높은** 질문을 우선 배치
+4. 각 추천 질문은 **서로 다른 업무 또는 관점**을 다루도록 구성
+
+### 응답 형식
+1. 인사 하지마. 바로 안내 시작해.
+2. 반드시 **한국어**로 답변해.
+3. 추천 질문은 번호를 매겨서 보기 좋게 정리해줘.
 
 대화내용 : {history}
 
@@ -1205,12 +1384,9 @@ REQUERY_PROMPT = """너는 JB우리캐피탈 오토운영팀 챗봇이야.
 # --------------------------------------------------------------------------
 # 입력 변수: {domain}, {subtask}, {other_subtasks}, {context}, {question}, {answer}
 # 출력: JSON {"follow_ups": ["질문1", "질문2", "질문3"]}
-#
-# 참고자료에 포함된 정보만을 기반으로 질문 생성 (환각 방지).
-# 질문 전략: 1) 같은 서브태스크 미다뤄진 내용, 2) 깊이 파기, 3) 타 서브태스크
 # ==========================================================================
 FOLLOWUP_PROMPT = """당신은 JB우리캐피탈 오토운영팀 챗봇의 후속 질문 생성기입니다.
-사용자에게 도움이 될 만한 후속 질문 3개를 생성하세요.
+사용자가 실제 업무를 처리하는 데 바로 활용할 수 있는 후속 질문 3개를 생성하세요.
 
 ### 현재 도메인: {domain} > {subtask}
 ### 같은 도메인의 다른 업무: {other_subtasks}
@@ -1226,11 +1402,52 @@ FOLLOWUP_PROMPT = """당신은 JB우리캐피탈 오토운영팀 챗봇의 후�
 
 ### 후속 질문 생성 규칙
 1. 질문은 반드시 위 참고자료에 포함된 정보를 기반으로 생성하세요. 참고자료에 없는 내용으로 질문을 만들지 마세요.
-2. 첫 번째 질문: 현재 답변과 동일한 업무({subtask}) 내에서, 참고자료에 있지만 답변에서 다루지 않은 세부 내용에 대한 질문
-3. 두 번째 질문: 현재 답변의 내용을 더 깊이 파고드는 질문 (예: 조건, 예외, 구체적 수치 등)
-4. 세 번째 질문: 같은 도메인의 다른 업무와 연관된 질문 (다른 업무가 없으면 현재 업무의 다른 측면)
-5. 사용자 관점에서 자연스러운 한국어 질문으로 작성하세요.
-6. 이미 답변된 내용을 그대로 다시 묻는 질문은 피하세요.
+2. **업무 처리 유도**: 사용자가 실제 업무에서 다음 단계로 진행하는 데 필요한 정보를 얻을 수 있는 질문을 만드세요.
+   - 좋은 예: "NICE등급 4등급인 개인고객의 론 최대 대출기간은?" (구체적 조건 → 실무 적용 가능)
+   - 나쁜 예: "론/할부에 대해 더 알려줘" (너무 일반적)
+3. 첫 번째 질문: 현재 답변에서 다룬 내용의 **구체적 조건이나 예외 케이스**를 확인하는 질문
+   - 예: 특정 등급/금액/고객유형에 따른 차이, 예외 적용 조건, 필요 서류 등
+4. 두 번째 질문: 현재 업무({subtask})에서 답변과 **연관되지만 아직 다루지 않은 실무 항목**에 대한 질문
+   - 예: 관련 수수료, 중도상환 조건, 연체 시 처리방법, 한도 산정 기준 등
+5. 세 번째 질문: 같은 도메인 내 **다른 업무와 비교하거나 연관된** 실무 질문 (다른 업무가 없으면 현재 업무의 다른 관점)
+   - 예: "이 조건에서 Dual Offer를 적용하면 한도가 달라지나요?"
+6. 질문은 사용자가 **바로 복사해서 입력할 수 있는** 완성된 형태로 작성하세요.
+7. 이미 답변된 내용을 그대로 다시 묻는 질문은 피하세요.
 
 ### 출력 형식 (JSON만 출력, 다른 텍스트 없이)
 {{"follow_ups": ["질문1", "질문2", "질문3"]}}"""
+
+
+# ==========================================================================
+# GROUNDING_CHECK_PROMPT - 답변 신뢰도 검증 프롬프트 (v5)
+# --------------------------------------------------------------------------
+# 입력 변수: {context}, {question}, {answer}
+# 출력: JSON {"score": 0.0~100.0, "reason": "..."}
+# ==========================================================================
+GROUNDING_CHECK_PROMPT = """너는 RAG 시스템의 답변 품질 검증기이다.
+아래 답변이 참고자료에 근거하여 정확하게 작성되었는지 검증하라.
+
+### 검증 기준 (각 항목을 개별 평가하여 종합 점수 산출)
+1. **사실 근거성** (40%): 답변의 주요 내용(수치, 기준, 조건 등)이 참고자료에서 직접 확인되는가?
+2. **무추측 원칙** (20%): 참고자료에 없는 내용을 추가하거나 추측하지 않았는가?
+3. **질문 적합성** (20%): 사용자의 질문에 적절히 대응하는 답변인가?
+4. **정보 정확성** (20%): 참고자료의 수치, 기준, 조건을 왜곡 없이 정확하게 전달했는가?
+
+### 채점 기준 (0.0 ~ 100.0%)
+- **90.0~100.0%**: 모든 내용이 참고자료에서 확인되며 정확함
+- **70.0~89.9%**: 대부분 참고자료에 근거하나 일부 표현이 참고자료와 미세하게 다름
+- **50.0~69.9%**: 핵심 내용은 맞으나 일부 세부사항이 참고자료에서 확인되지 않음
+- **30.0~49.9%**: 참고자료에 근거한 내용과 근거 없는 내용이 혼재
+- **0.0~29.9%**: 대부분의 내용이 참고자료에서 확인되지 않음
+
+### 참고자료
+{context}
+
+### 사용자 질문
+{question}
+
+### 생성된 답변
+{answer}
+
+### 출력 형식 (JSON만 출력, 다른 텍스트 없이)
+{{"score": 0.0에서100.0사이소수점첫째자리숫자, "reason": "검증 결과를 한 문장으로 설명"}}"""
