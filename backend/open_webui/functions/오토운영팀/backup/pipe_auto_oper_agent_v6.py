@@ -41,6 +41,19 @@
 #   - 답변 끝에 신뢰도 점수 표시 (1~10점 + 사유)
 #   - _generate(), _generate_with_image() 양쪽 경로 모두 적용
 #   - ENABLE_GROUNDING_CHECK Valve로 ON/OFF 가능
+# 2026-02-27 v6(운영) : 이미지 경로 스트리밍 전환
+#   - _generate_with_image(): non-streaming → streaming 전환
+#   - 이미지 URL을 첫 SSE 청크 prefix에 포함하여 즉시 표시
+#   - LLM 답변 실시간 스트리밍 (기존: 전체 완료 대기 후 문자 단위 출력)
+#   - 후속질문/신뢰도는 스트림 완료 후 append (기존과 동일)
+# 2026-03-03 v7(운영) : 검색 품질 및 응답 속도 개선
+#   - RRF 가중치 Valve 추가 (RRF_VECTOR_WEIGHT=0.7, RRF_BM25_WEIGHT=0.3)
+#   - 검색 결과 중복 제거: page_content 기준 이미 수집된 문서 건너뜀
+#   - 후속질문 + 신뢰도 병렬 실행 (asyncio.create_task, 대기시간 절반)
+#   - 병렬 실행 중 상태 메시지 표시 ("추천 질문 / 답변 신뢰도 확인 중...")
+#   - 결과 한번에 노출 (추천질문 + 신뢰도를 단일 청크로 전송)
+#   - 신뢰도 사유(reason) 텍스트 제거, 점수만 표시
+#   - suffix 멘트 제거 ("다른 운영기준이 필요한 경우..." 삭제)
 ############################################
 
 ##########################################################################
@@ -191,6 +204,8 @@ class Pipe:
         # 하이브리드 검색 설정
         ENABLE_HYBRID_SEARCH: bool = True             # False로 하면 벡터 검색만 사용
         RRF_K: int = 60                               # RRF 상수 (기본 60, 클수록 순위 차이 완화)
+        RRF_VECTOR_WEIGHT: float = 0.7                # 벡터(시멘틱) 검색 가중치
+        RRF_BM25_WEIGHT: float = 0.3                  # BM25(키워드) 검색 가중치
         # 답변 신뢰도 검증 설정
         ENABLE_GROUNDING_CHECK: bool = True           # False로 하면 신뢰도 검증 미수행
 
@@ -439,6 +454,7 @@ class Pipe:
     async def _react_agent(self, state: dict) -> dict:
         """ReAct 루프: Think→Act→Observe 반복으로 관련 문서 수집"""
         observations = []
+        seen_contents = set()  # 중복 제거용 (page_content 기준)
         send_status = state["send_status"]
 
         for i in range(self.valves.REACT_MAX_ITERATIONS):
@@ -480,7 +496,14 @@ class Pipe:
                     done=False,
                 )
 
-                docs = self._execute_tool(query, subtask)
+                raw_docs = self._execute_tool(query, subtask)
+
+                # ── 중복 제거: 이전 검색에서 이미 수집된 문서 제외 ──
+                docs = []
+                for d in raw_docs:
+                    if d.page_content not in seen_contents:
+                        seen_contents.add(d.page_content)
+                        docs.append(d)
 
                 # ── Observe: 검색 결과를 관측 기록에 추가 ──
                 offset = sum(len(obs["docs"]) for obs in observations)
@@ -598,19 +621,21 @@ class Pipe:
     # 양쪽 검색에서 모두 상위에 있는 문서가 높은 점수를 받음.
     # =================================================================
     def _rrf_merge(self, vector_docs: list, bm25_docs: list, k: int) -> list:
-        """벡터 + BM25 결과를 RRF로 결합하여 상위 k개 반환"""
+        """벡터 + BM25 결과를 가중 RRF로 결합하여 상위 k개 반환"""
         rrf_k = self.valves.RRF_K
+        w_vec = self.valves.RRF_VECTOR_WEIGHT
+        w_bm25 = self.valves.RRF_BM25_WEIGHT
         doc_scores = {}    # page_content → RRF 점수
         doc_objects = {}   # page_content → Document 객체
 
         for rank, doc in enumerate(vector_docs):
             key = doc.page_content
-            doc_scores[key] = doc_scores.get(key, 0) + 1 / (rrf_k + rank + 1)
+            doc_scores[key] = doc_scores.get(key, 0) + w_vec / (rrf_k + rank + 1)
             doc_objects[key] = doc
 
         for rank, doc in enumerate(bm25_docs):
             key = doc.page_content
-            doc_scores[key] = doc_scores.get(key, 0) + 1 / (rrf_k + rank + 1)
+            doc_scores[key] = doc_scores.get(key, 0) + w_bm25 / (rrf_k + rank + 1)
             if key not in doc_objects:
                 doc_objects[key] = doc
 
@@ -734,53 +759,78 @@ class Pipe:
             suffix_chunk = f"data: {json.dumps(suffix_data, ensure_ascii=False)}\n\n"
             yield suffix_chunk.encode("utf-8")
 
-            # 후속 추천 질문 생성 (v3 기능)
+            # 후속질문 + 신뢰도 병렬 실행 (상태 메시지 표시 후 한번에 노출)
             full_answer = "".join(collected_answer)
-            if _self.valves.ENABLE_FOLLOWUPS:
-                follow_ups = await _self._generate_followups(_state, full_answer)
-                if follow_ups:
-                    followup_text = "\n\n---\n**추천 질문:**\n"
-                    for idx, q in enumerate(follow_ups, 1):
-                        followup_text += f"{idx}. {q}\n"
-                    followup_data = {
-                        "choices": [{"delta": {"content": followup_text}}]
-                    }
-                    followup_chunk = f"data: {json.dumps(followup_data, ensure_ascii=False)}\n\n"
-                    yield followup_chunk.encode("utf-8")
+            _send_status = _state["send_status"]
 
-            # 답변 신뢰도 검증 (v5 기능)
+            followup_task = None
+            grounding_task = None
+            if _self.valves.ENABLE_FOLLOWUPS:
+                followup_task = asyncio.create_task(
+                    _self._generate_followups(_state, full_answer)
+                )
             if _self.valves.ENABLE_GROUNDING_CHECK and full_answer:
-                grounding = await _self._check_grounding(_state, full_answer)
-                if grounding:
-                    score = grounding["score"]
-                    reason = grounding["reason"]
-                    filled = int(score / 10)
-                    bar = "\u25a0" * filled + "\u25a1" * (10 - filled)
-                    grounding_text = f"\n\n---\n**[답변 신뢰도: {bar} {score}%]** {reason}"
-                    grounding_data = {
-                        "choices": [{"delta": {"content": grounding_text}}]
-                    }
-                    grounding_chunk = f"data: {json.dumps(grounding_data, ensure_ascii=False)}\n\n"
-                    yield grounding_chunk.encode("utf-8")
+                grounding_task = asyncio.create_task(
+                    _self._check_grounding(_state, full_answer)
+                )
+
+            if followup_task or grounding_task:
+                await _send_status(
+                    status_message="추천 질문 / 답변 신뢰도 확인 중...",
+                    done=False,
+                )
+
+            # 두 태스크 모두 완료 대기
+            follow_ups = None
+            grounding = None
+            if followup_task:
+                follow_ups = await followup_task
+            if grounding_task:
+                grounding = await grounding_task
+
+            if followup_task or grounding_task:
+                await _send_status(
+                    status_message="완료",
+                    done=True,
+                )
+
+            # 결과 한번에 노출
+            extra_text = ""
+            if follow_ups:
+                extra_text += "\n\n---\n**추천 질문:**\n"
+                for idx, q in enumerate(follow_ups, 1):
+                    extra_text += f"{idx}. {q}\n"
+            if grounding:
+                score = grounding["score"]
+                filled = int(score / 10)
+                bar = "\u25a0" * filled + "\u25a1" * (10 - filled)
+                extra_text += f"\n\n---\n**[답변 신뢰도: {bar} {score}%]**"
+
+            if extra_text:
+                extra_data = {
+                    "choices": [{"delta": {"content": extra_text}}]
+                }
+                extra_chunk = f"data: {json.dumps(extra_data, ensure_ascii=False)}\n\n"
+                yield extra_chunk.encode("utf-8")
 
         return StreamingResponse(
             stream_with_extras(), media_type="text/plain; charset=utf-8"
         )
 
     # =================================================================
-    # _generate_with_image() - 이미지 포함 답변 생성 (non-streaming)
+    # _generate_with_image() - 이미지 포함 답변 생성 (streaming)
     # ---------------------------------------------------------------
     # 중고승용 도메인 첫 진입 시 호출.
     # ChromaDB 이미지 컬렉션에서 서브태스크에 해당하는 운영기준 이미지를 검색.
-    # non-streaming으로 LLM 답변을 생성한 후, 이미지 + 답변 + 후속질문을
-    # 하나의 문자열로 결합하여 sync generator로 반환.
+    # 이미지 URL을 prefix에 포함시켜 첫 청크에 즉시 전송한 후,
+    # LLM 답변을 실시간 스트리밍으로 전달.
     #
-    # ★ _generate()와 달리 스트리밍이 아닌 이유:
-    #    이미지 URL을 답변 상단에 배치해야 하므로 전체 텍스트를 먼저 조합.
-    #    sync generator(char 단위)로 반환하여 Open WebUI의 타이핑 효과 유지.
+    # v6 개선: non-streaming → streaming 전환
+    #   기존: LLM 전체 완료 대기 → 후속질문 대기 → 신뢰도 대기 → 한번에 출력
+    #   개선: 이미지 즉시 표시 → LLM 실시간 스트리밍 → 후속질문/신뢰도 append
     # =================================================================
     async def _generate_with_image(self, state: dict):
-        """첫 진입시 이미지 + 답변 생성 (non-streaming → sync generator)"""
+        """첫 진입시 이미지 + 답변 생성 (streaming)"""
         domain = state["domain"]
         subtask = state["subtask"]
         filtered_docs = state["filtered_docs"]
@@ -820,7 +870,6 @@ class Pipe:
         await send_status(status_message=f"완료: {exe_time:.2f}초", done=True)
 
         # ── 출처(citation) 전송 ──
-        # 이미지 경로에서도 참고자료 출처를 프론트엔드에 전달
         send_citation = get_send_citation(state["event_emitter"])
         for idx, doc in enumerate(filtered_docs, start=1):
             await send_citation(
@@ -829,38 +878,115 @@ class Pipe:
                 content=doc.page_content,
             )
 
-        # non-streaming LLM 호출 (이미지와 조합해야 하므로 전체 텍스트 한번에 생성)
-        llm_text = await self._llm_call(prompt, state)
+        # ── StreamingResponse: 이미지 + LLM 스트리밍 + 후속질문/신뢰도 ──
+        prefix = f"#### [{display_name} > {subtask}]\n{image_url}\n"
+        suffix = f"\n\n **[{display_name}입니다. 다른 운영기준이 필요한 경우 '새 채팅'을 이용해주세요.]**"
 
-        # ── 후속 추천 질문 생성 (v3 기능) ──
-        followup_text = ""
-        if self.valves.ENABLE_FOLLOWUPS:
-            follow_ups = await self._generate_followups(state, llm_text)
+        data_json = {
+            "model": self.valves.LLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "temperature": 0,
+        }
+        original_response = await generate_chat_completion(
+            state["__request__"], data_json, state["user"]
+        )
+
+        _state = state
+        _self = self
+
+        async def stream_with_extras():
+            prefix_sent = False
+            collected_answer = []
+            async for chunk in original_response.body_iterator:
+                decoded_chunk = (
+                    chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                )
+                if decoded_chunk.startswith("data:"):
+                    json_data = decoded_chunk.lstrip("data:").strip()
+                    try:
+                        data = json.loads(json_data)
+                        choices = data.get("choices", [])
+                        for choice in choices:
+                            content = choice.get("delta", {}).get("content")
+                            if content is not None:
+                                collected_answer.append(content)
+                                if not prefix_sent:
+                                    choice["delta"]["content"] = prefix + content
+                                    prefix_sent = True
+                                    break
+
+                        modified_chunk = (
+                            f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                        )
+                        yield modified_chunk.encode("utf-8")
+                    except json.JSONDecodeError:
+                        yield chunk
+                else:
+                    yield chunk
+
+            # suffix 청크
+            suffix_data = {
+                "choices": [{"delta": {"content": suffix}}]
+            }
+            suffix_chunk = f"data: {json.dumps(suffix_data, ensure_ascii=False)}\n\n"
+            yield suffix_chunk.encode("utf-8")
+
+            # 후속질문 + 신뢰도 병렬 실행 (상태 메시지 표시 후 한번에 노출)
+            full_answer = "".join(collected_answer)
+            _send_status = _state["send_status"]
+
+            followup_task = None
+            grounding_task = None
+            if _self.valves.ENABLE_FOLLOWUPS:
+                followup_task = asyncio.create_task(
+                    _self._generate_followups(_state, full_answer)
+                )
+            if _self.valves.ENABLE_GROUNDING_CHECK and full_answer:
+                grounding_task = asyncio.create_task(
+                    _self._check_grounding(_state, full_answer)
+                )
+
+            if followup_task or grounding_task:
+                await _send_status(
+                    status_message="추천 질문 / 답변 신뢰도 확인 중...",
+                    done=False,
+                )
+
+            follow_ups = None
+            grounding = None
+            if followup_task:
+                follow_ups = await followup_task
+            if grounding_task:
+                grounding = await grounding_task
+
+            if followup_task or grounding_task:
+                await _send_status(
+                    status_message="완료",
+                    done=True,
+                )
+
+            extra_text = ""
             if follow_ups:
-                followup_text = "\n\n---\n**추천 질문:**\n"
+                extra_text += "\n\n---\n**추천 질문:**\n"
                 for idx, q in enumerate(follow_ups, 1):
-                    followup_text += f"{idx}. {q}\n"
-
-        # ── 답변 신뢰도 검증 (v5 기능) ──
-        grounding_text = ""
-        if self.valves.ENABLE_GROUNDING_CHECK and llm_text:
-            grounding = await self._check_grounding(state, llm_text)
+                    extra_text += f"{idx}. {q}\n"
             if grounding:
                 score = grounding["score"]
-                reason = grounding["reason"]
                 filled = int(score / 10)
                 bar = "\u25a0" * filled + "\u25a1" * (10 - filled)
-                grounding_text = f"\n\n---\n**[답변 신뢰도: {bar} {score}%]** {reason}"
+                extra_text += f"\n\n---\n**[답변 신뢰도: {bar} {score}%]**"
 
-        # ── 최종 출력 조합: 헤더 + 이미지 + LLM답변 + 후속질문 + 신뢰도 ──
-        combined = f"#### [{display_name} > {subtask}]\n{image_url}\n{llm_text}{followup_text}{grounding_text}"
+            if extra_text:
+                extra_data = {
+                    "choices": [{"delta": {"content": extra_text}}]
+                }
+                extra_chunk = f"data: {json.dumps(extra_data, ensure_ascii=False)}\n\n"
+                yield extra_chunk.encode("utf-8")
 
-        # sync generator: 문자 단위로 yield하여 타이핑 효과 구현
-        def stream_output():
-            for char in combined:
-                yield char
-
-        return stream_output()
+        return StreamingResponse(
+            stream_with_extras(), media_type="text/plain; charset=utf-8"
+        )
 
     # =================================================================
     # _generate_followups() - 후속 추천 질문 생성 (v3 기능)
