@@ -19,7 +19,8 @@
       "Bash(./venv/Scripts/python.exe -m uvicorn:*)",
       "Bash(curl:*)",
       "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe:*)",
-      "Bash(docker compose up:*)"
+      "Bash(docker compose up:*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''backend/open_webui/functions/오토운영팀/pipe_auto_oper_chat_agent_v6.py'', doraise=True\\)\")"
     ]
   }
 }
